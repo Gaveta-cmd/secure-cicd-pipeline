@@ -48,9 +48,3 @@ def create_item():
     new_item = {"id": "3", "name": name, "category": category}
     return jsonify(new_item), 201
 
-
-@main.errorhandler(400)
-@main.errorhandler(404)
-@main.errorhandler(405)
-def handle_error(error):
-    return jsonify({"error": str(error.description)}), error.code
