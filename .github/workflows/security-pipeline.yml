@@ -1,0 +1,293 @@
+name: Secure CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ────────────────────────────────────────────────
+  # Stage 1: Secrets Scanning (Gitleaks)
+  # ────────────────────────────────────────────────
+  secrets-scan:
+    name: Secrets Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # ────────────────────────────────────────────────
+  # Stage 2: SAST — Semgrep + Bandit
+  # ────────────────────────────────────────────────
+  sast:
+    name: SAST (Semgrep + Bandit)
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run Bandit
+        run: |
+          bandit -r app/ \
+            -f sarif \
+            -o bandit-results.sarif \
+            --severity-level medium \
+            --confidence-level medium
+        continue-on-error: true
+
+      - name: Upload Bandit SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: bandit-results.sarif
+          category: bandit
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/python
+            p/flask
+            p/owasp-top-ten
+            p/secrets
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+  # ────────────────────────────────────────────────
+  # Stage 3: Dependency Scanning (pip-audit)
+  # ────────────────────────────────────────────────
+  dependency-scan:
+    name: Dependency Scan (pip-audit)
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Audit dependencies
+        run: |
+          pip-audit \
+            -r requirements.txt \
+            --format=json \
+            --output=pip-audit-report.json \
+            --vulnerability-service=osv
+        continue-on-error: true
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-report
+          path: pip-audit-report.json
+          retention-days: 30
+
+      - name: Fail on critical vulnerabilities
+        run: |
+          python - <<'EOF'
+          import json, sys
+          with open("pip-audit-report.json") as f:
+              data = json.load(f)
+          critical = [
+              dep for dep in data.get("dependencies", [])
+              if any(
+                  v.get("fix_versions") is not None
+                  for v in dep.get("vulns", [])
+              )
+          ]
+          if critical:
+              names = [d["name"] for d in critical]
+              print(f"::error::Vulnerable packages with available fixes: {names}")
+              sys.exit(1)
+          EOF
+
+  # ────────────────────────────────────────────────
+  # Stage 4: Unit Tests
+  # ────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests (pytest)
+    runs-on: ubuntu-latest
+    needs: [sast, dependency-scan]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests with coverage
+        run: pytest
+
+  # ────────────────────────────────────────────────
+  # Stage 5: IaC / Container Scanning (Checkov + Trivy)
+  # ────────────────────────────────────────────────
+  iac-scan:
+    name: IaC & Container Scan (Checkov + Trivy)
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: github_actions,secrets
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: true
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+      - name: Run Trivy (filesystem scan)
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+  # ────────────────────────────────────────────────
+  # Stage 6: Policy-as-Code (OPA / Conftest)
+  # ────────────────────────────────────────────────
+  policy-check:
+    name: Policy Gate (OPA / Conftest)
+    runs-on: ubuntu-latest
+    needs: [sast, dependency-scan, iac-scan]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Conftest
+        run: |
+          curl -Lo conftest.tar.gz \
+            https://github.com/open-policy-agent/conftest/releases/download/v0.57.0/conftest_0.57.0_Linux_x86_64.tar.gz
+          tar xzf conftest.tar.gz
+          sudo mv conftest /usr/local/bin/
+
+      - name: Validate workflow against policies
+        run: |
+          conftest test .github/workflows/security-pipeline.yml \
+            --policy policies/ \
+            --output json
+
+      - name: Validate app config against policies
+        run: |
+          conftest test pytest.ini requirements.txt \
+            --policy policies/ \
+            --output json
+
+  # ────────────────────────────────────────────────
+  # Stage 7: Security Summary
+  # ────────────────────────────────────────────────
+  security-summary:
+    name: Security Summary
+    runs-on: ubuntu-latest
+    needs: [unit-tests, policy-check]
+    if: always()
+    steps:
+      - name: Evaluate pipeline status
+        run: |
+          echo "## Security Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets Scan | ${{ needs.secrets-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST | ${{ needs.sast.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Scan | ${{ needs.dependency-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Tests | ${{ needs.unit-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| IaC Scan | ${{ needs.iac-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Policy Check | ${{ needs.policy-check.result }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ────────────────────────────────────────────────
+  # Stage 8: Manual Approval Gate → Deploy
+  # ────────────────────────────────────────────────
+  deploy-approval:
+    name: Manual Approval Gate
+    runs-on: ubuntu-latest
+    needs: [unit-tests, policy-check]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+    steps:
+      - name: Approval granted
+        run: echo "Deployment to production approved."
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-approval
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install production dependencies
+        run: pip install -r requirements.txt
+
+      - name: Deploy (placeholder)
+        run: |
+          echo "Deploying to production..."
+          echo "Target: ${{ vars.DEPLOY_ENV }}"
+          # Replace this step with your actual deployment command,
+          # e.g.: fly deploy, Railway deploy, Render webhook, etc.
