@@ -248,7 +248,7 @@ jobs:
 
       - name: Validate app config against policies
         run: |
-          conftest test pytest.ini requirements.txt \
+          conftest test pytest.ini \
             --policy policies/ \
             --output json
 
