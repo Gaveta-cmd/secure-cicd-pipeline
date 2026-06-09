@@ -68,14 +68,24 @@ jobs:
             -o bandit-results.sarif \
             --severity-level medium \
             --confidence-level medium || true
-          # Guarantee the file exists for the upload step even when no issues are found
           [ -f bandit-results.sarif ] || \
             echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[]}' \
             > bandit-results.sarif
 
+      - name: Check Bandit SARIF has results
+        id: bandit-check
+        if: always()
+        run: |
+          count=$(jq '[.runs[].results // [] | length] | add // 0' bandit-results.sarif 2>/dev/null || echo 0)
+          if [ "$count" -gt 0 ]; then
+            echo "has_results=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_results=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Upload Bandit SARIF
         uses: github/codeql-action/upload-sarif@v4
-        if: always()
+        if: always() && steps.bandit-check.outputs.has_results == 'true'
         with:
           sarif_file: bandit-results.sarif
           category: bandit
