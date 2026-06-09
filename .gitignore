@@ -1,0 +1,56 @@
+# Environment variables — NEVER commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Keys and certificates
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets/
+credentials/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+pip-audit-report.*
+
+# Dependency and SAST reports (generated at runtime)
+reports/
+*.sarif
+bandit-report.*
+semgrep-report.*
+trivy-report.*
+checkov-report.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Logs
+*.log
+logs/
