@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest==8.3.5
+pytest-cov==6.1.0
+bandit==1.8.3
+pip-audit==2.9.0
+semgrep==1.124.0
